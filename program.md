@@ -12,11 +12,50 @@ To set up a new experiment, work with the user to:
    - `README.md` — repository context.
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
+   - `taguchi_mode.py` — Taguchi orthogonal array optimization (optional but recommended).
 4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good.
 
 Once you get confirmation, kick off the experimentation.
+
+## Taguchi Mode (Recommended for Hyperparameter Optimization)
+
+Instead of testing one change at a time, use **Taguchi orthogonal arrays** to test multiple hyperparameters simultaneously with far fewer experiments.
+
+**When to use Taguchi mode:**
+- You want to optimize multiple hyperparameters (e.g., DEPTH, MATRIX_LR, WEIGHT_DECAY)
+- You need to find the optimal combination efficiently
+- You're at a stable baseline and want to tune hyperparameters
+
+**Example: Optimize 3 hyperparameters with only 9 experiments (instead of 27):**
+
+```python
+from taguchi_mode import run_taguchi_sweep
+
+factors = {
+    "DEPTH": ["6", "8", "10"],
+    "MATRIX_LR": ["0.02", "0.04", "0.08"],
+    "WEIGHT_DECAY": ["0.1", "0.2", "0.3"],
+}
+
+optimal = run_taguchi_sweep(factors, metric="val_bpb", higher_is_better=False)
+# Returns: {"DEPTH": "8", "MATRIX_LR": "0.04", "WEIGHT_DECAY": "0.2"}
+```
+
+**Efficiency gains:**
+| Factors | Levels | Full Factorial | Taguchi | Savings |
+|---------|--------|---------------|---------|---------|
+| 3 | 3 | 27 runs | 9 runs (L9) | 67% |
+| 4 | 3 | 81 runs | 9 runs (L9) | 89% |
+| 7 | 2 | 128 runs | 8 runs (L8) | 94% |
+
+**After Taguchi sweep:**
+1. Apply the recommended optimal configuration to `train.py`
+2. Commit and record as a new baseline
+3. Continue with creative architectural experiments or run another Taguchi sweep with refined ranges
+
+See `taguchi_mode.py` for full documentation.
 
 ## Experimentation
 
