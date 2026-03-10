@@ -18,25 +18,14 @@ Usage:
 
 import subprocess
 import re
-import shutil
-import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union, Any, Callable
 
-from . import Experiment, Analyzer, TaguchiError
+from . import Experiment, Analyzer
+from .errors import TaguchiError
 from .signal_analysis import SignalAnalyzer
-
-
-# Basic configuration from environment variables
-def get_config():
-    """Get configuration from environment variables with defaults."""
-    return {
-        'training_timeout': int(os.getenv('TAGUCHI_TRAINING_TIMEOUT', '400')),
-        'training_command': os.getenv('TAGUCHI_TRAINING_CMD', 'uv run train.py').split(),
-        'config_file': os.getenv('TAGUCHI_CONFIG_FILE', 'train.py'),
-        'debug_mode': os.getenv('TAGUCHI_DEBUG', 'false').lower() == 'true',
-        'max_retries': int(os.getenv('TAGUCHI_MAX_RETRIES', '0')),
-    }
+from .config import TaguchiConfig, ConfigManager
+from .system import SystemRunner, FileManager
 
 
 def run_taguchi_sweep(
@@ -44,239 +33,267 @@ def run_taguchi_sweep(
     metric: str = "val_bpb",
     higher_is_better: bool = False,
     array_type: Optional[str] = None,
-    config: Optional[Dict] = None,
+    config: Optional[Union[Dict[str, Any], TaguchiConfig]] = None,
+    runner: Optional[SystemRunner] = None,
+    file_manager: Optional[FileManager] = None,
 ) -> Dict[str, str]:
     """
     Execute a Taguchi orthogonal array experimental design for hyperparameter optimization.
-    
-    Implements systematic experimental design with automatic resource management.
     
     Args:
         factors: Dict mapping factor names to list of level values
         metric: Metric name to optimize (default: "val_bpb")
         higher_is_better: If True, maximize metric; if False, minimize
         array_type: Specific orthogonal array (e.g., "L9"). If None, auto-select.
-        config: Optional config dict. If None, loads from environment variables.
-    
-    Environment Variables:
-        TAGUCHI_TRAINING_TIMEOUT: Training command timeout in seconds (default: 400)
-        TAGUCHI_TRAINING_CMD: Training command (default: "uv run train.py")
-        TAGUCHI_CONFIG_FILE: Config file to modify (default: "train.py")
-        TAGUCHI_DEBUG: Enable debug output (default: false)
-        TAGUCHI_MAX_RETRIES: Max retries for training (default: 0)
+        config: Optional config dict or TaguchiConfig instance.
+        runner: Optional SystemRunner for command execution (allows mocking).
+        file_manager: Optional FileManager for file operations (allows mocking).
     
     Returns:
         Dict mapping factor names to optimal level values
     """
-    # Load configuration
-    cfg = config or get_config()
+    # Initialize components
+    runner = runner or SystemRunner()
+    file_manager = file_manager or FileManager()
+    
+    # Resolve configuration
+    if config is None:
+        cfg = ConfigManager.get_default_config()
+    elif isinstance(config, dict):
+        cfg = ConfigManager.get_default_config().copy(**config)
+    else:
+        cfg = config
+
     with Experiment(array_type=array_type) as exp:
         for name, levels in factors.items():
             exp.add_factor(name, levels)
         
         runs = exp.generate()
         
-        print(f"\n{'='*60}")
-        print(f"Taguchi Hyperparameter Sweep")
-        print(f"{'='*60}")
-        print(f"Array: {exp.array_type} ({exp.num_runs} runs)")
-        print(f"Factors: {len(factors)}")
-        print(f"Metric: {metric} ({'higher' if higher_is_better else 'lower'} is better)")
-        print(f"{'='*60}\n")
+        _print_header(exp, factors, metric, higher_is_better, cfg.dry_run)
         
         with Analyzer(exp, metric_name=metric) as analyzer:
             for i, run in enumerate(runs):
                 print(f"\n[{i+1}/{len(runs)}] Run {run['run_id']}: {run['factors']}")
                 
-                # Fix critical race condition: backup inside try block
-                backup = None
-                try:
-                    # Validate config file exists before proceeding
-                    config_file_path = Path(cfg['config_file'])
-                    if not config_file_path.exists():
-                        print(f"  → Error: {cfg['config_file']} not found in current directory")
-                        continue
-                    
-                    backup = config_file_path.read_text()
-                    
-                    # Update configuration file with factors
-                    if cfg['config_file'] == 'train.py':
-                        update_train_py(run['factors'])
-                    else:
-                        # For non-train.py files, use generic update
-                        update_config_file(cfg['config_file'], run['factors'])
-                    
-                    # Validate training command exists
-                    cmd_executable = cfg['training_command'][0]
-                    if not shutil.which(cmd_executable):
-                        print(f"  → Error: '{cmd_executable}' command not found")
-                        continue
-                    
-                    # Execute training with retry logic
-                    attempt = 0
-                    max_attempts = cfg['max_retries'] + 1
-                    
-                    while attempt < max_attempts:
-                        try:
-                            if cfg['debug_mode']:
-                                print(f"  → Debug: Running {' '.join(cfg['training_command'])} (attempt {attempt + 1})")
-                            
-                            result = subprocess.run(
-                                cfg['training_command'],
-                                capture_output=True,
-                                text=True,
-                                timeout=cfg['training_timeout']
-                            )
-                            break  # Success, exit retry loop
-                            
-                        except subprocess.TimeoutExpired:
-                            attempt += 1
-                            if attempt >= max_attempts:
-                                raise
-                            print(f"  → Timeout (>{cfg['training_timeout']}s), retrying... ({attempt + 1}/{max_attempts})")
-                            continue
-                        except Exception as e:
-                            attempt += 1
-                            if attempt >= max_attempts:
-                                raise
-                            print(f"  → Error: {e}, retrying... ({attempt + 1}/{max_attempts})")
-                            continue
-                    
-                    value = parse_metric(result.stdout, metric)
-                    if value is not None:
-                        print(f"  → {metric}: {value}")
-                        analyzer.add_result(run['run_id'], value)
-                    else:
-                        print(f"  → Failed to parse {metric}")
-                        if result.returncode != 0:
-                            print(f"  → Exit code: {result.returncode}")
-                            stderr_preview = (result.stderr.strip()[:100] + "...") if len(result.stderr.strip()) > 100 else result.stderr.strip()
-                            if stderr_preview:
-                                print(f"  → Error: {stderr_preview}")
-                            
-                except subprocess.TimeoutExpired:
-                    print(f"  → Timeout (>400s)")
-                except Exception as e:
-                    print(f"  → Error: {e}")
-                finally:
-                    # Only restore if backup was successfully created
-                    if backup is not None:
-                        try:
-                            Path(cfg['config_file']).write_text(backup)
-                        except Exception as restore_error:
-                            print(f"  → Critical: Failed to restore {cfg['config_file']}: {restore_error}")
-                            print(f"  → Manual intervention required!")
+                if cfg.dry_run:
+                    print(f"  → [DRY RUN] Would update {cfg.config_file} and run {' '.join(cfg.training_command)}")
+                    # Simulate a result for dry run analysis if needed, or just skip
+                    continue
+
+                value = _execute_single_run(run, cfg, runner, file_manager, metric)
+                if value is not None:
+                    print(f"  → {metric}: {value}")
+                    analyzer.add_result(run['run_id'], value)
             
+            if cfg.dry_run:
+                print("\nDry run completed. No actual runs were executed.")
+                return {}
+
             if not analyzer._results:
                 print("\nNo successful runs!")
                 return {}
             
-            print(f"\n{'='*60}")
-            print(f"Analysis ({len(analyzer._results)}/{len(runs)} successful)")
-            print(f"{'='*60}")
-            print(analyzer.summary())
-            
-            optimal = analyzer.recommend_optimal(higher_is_better=higher_is_better)
-            print(f"\nRecommended:")
-            for factor, level in optimal.items():
-                print(f"  {factor}: {level}")
+            _print_summary(analyzer, runs, optimal := analyzer.recommend_optimal(higher_is_better=higher_is_better))
             
             # Basic SNR Analysis for original version  
-            if cfg.get('debug_mode', False):
-                print(f"\n{'='*60}")
-                print("SIGNAL-TO-NOISE RATIO ANALYSIS (Debug Mode)")
-                print(f"{'='*60}")
-                
-                signal_analyzer = SignalAnalyzer()
-                signal_analyzer.set_experimental_data(runs, analyzer._results, factors)
-                
-                # Generate basic SNR report
-                snr_report = signal_analyzer.generate_signal_report(higher_is_better)
-                print(snr_report)
+            if cfg.debug_mode:
+                _print_snr_analysis(runs, analyzer._results, factors, higher_is_better)
             
             return optimal
 
 
-def update_train_py(factors: Dict[str, str]) -> None:
-    """
-    Update train.py hyperparameters with validation.
-    
-    Validates that all required variables exist before making any changes.
-    Raises TaguchiError if any variables are missing or updates fail.
-    """
-    train_py = Path("train.py")
-    content = train_py.read_text()
-    
-    # Validate all required variables exist first
-    missing_vars = []
-    for key in factors.keys():
-        pattern = rf'^(\s*){re.escape(key)}\s*='
-        if not re.search(pattern, content, flags=re.MULTILINE):
-            missing_vars.append(key)
-    
-    if missing_vars:
-        raise TaguchiError(f"Variables not found in train.py: {missing_vars}")
-    
-    # Apply replacements with safer pattern matching
-    original_content = content
-    for key, value in factors.items():
-        pattern = rf'^(\s*)({re.escape(key)})\s*=\s*[^#\n]+(#.*)?$'
-        replacement = rf'\1\2 = {value}\3'
-        new_content = re.sub(pattern, replacement, content, flags=re.MULTILINE)
-        
-        # Verify the replacement actually happened
-        if new_content == content:
-            raise TaguchiError(f"Failed to update variable: {key}")
-        content = new_content
-    
-    # Verify we actually made changes
-    if content == original_content:
-        raise TaguchiError("No variables were updated - check factor names")
-    
-    train_py.write_text(content)
+def _print_header(exp, factors, metric, higher_is_better, dry_run):
+    print(f"\n{'='*60}")
+    print(f"Taguchi Hyperparameter Sweep {'(DRY RUN)' if dry_run else ''}")
+    print(f"{'='*60}")
+    print(f"Array: {exp.array_type} ({exp.num_runs} runs)")
+    print(f"Factors: {len(factors)}")
+    print(f"Metric: {metric} ({'higher' if higher_is_better else 'lower'} is better)")
+    print(f"{'='*60}\n")
 
 
-def update_config_file(config_file: str, factors: Dict[str, str]) -> None:
+def _print_summary(analyzer, runs, optimal):
+    print(f"\n{'='*60}")
+    print(f"Analysis ({len(analyzer._results)}/{len(runs)} successful)")
+    print(f"{'='*60}")
+    print(analyzer.summary())
+    
+    print(f"\nRecommended:")
+    for factor, level in optimal.items():
+        print(f"  {factor}: {level}")
+
+
+def _print_snr_analysis(runs, results, factors, higher_is_better):
+    print(f"\n{'='*60}")
+    print("SIGNAL-TO-NOISE RATIO ANALYSIS (Debug Mode)")
+    print(f"{'='*60}")
+    
+    signal_analyzer = SignalAnalyzer()
+    signal_analyzer.set_experimental_data(runs, results, factors)
+    
+    # Generate basic SNR report
+    snr_report = signal_analyzer.generate_signal_report(higher_is_better)
+    print(snr_report)
+
+
+def _execute_single_run(
+    run: Dict[str, Any],
+    cfg: TaguchiConfig,
+    runner: SystemRunner,
+    file_manager: FileManager,
+    metric: str
+) -> Optional[float]:
+    """Handles the lifecycle of a single experimental run."""
+    backup = None
+    config_path = Path(cfg.config_file)
+    
+    try:
+        # 1. Prepare: Validate and Backup
+        if not file_manager.exists(config_path):
+            print(f"  → Error: {cfg.config_file} not found")
+            return None
+            
+        backup = file_manager.read_text(config_path)
+        
+        # 2. Modify: Update config file
+        update_config_file(cfg.config_file, run['factors'], file_manager)
+        
+        # 3. Execute: Run training with retry logic
+        result = _run_training_with_retries(cfg, runner, file_manager)
+        
+        # 4. Process: Parse results
+        if result:
+            value = parse_metric(result.stdout, metric)
+            if value is None and result.returncode != 0:
+                print(f"  → Exit code: {result.returncode}")
+                stderr_preview = (result.stderr.strip()[:100] + "...") if len(result.stderr.strip()) > 100 else result.stderr.strip()
+                if stderr_preview:
+                    print(f"  → Error: {stderr_preview}")
+            return value
+            
+    except Exception as e:
+        print(f"  → Error: {e}")
+    finally:
+        # 5. Restore: Always return to original state
+        if backup is not None:
+            try:
+                file_manager.write_text(config_path, backup)
+            except Exception as restore_error:
+                print(f"  → Critical: Failed to restore {cfg.config_file}: {restore_error}")
+                
+    return None
+
+
+def _run_training_with_retries(
+    cfg: TaguchiConfig,
+    runner: SystemRunner,
+    file_manager: FileManager
+) -> Optional[subprocess.CompletedProcess]:
+    """Executes training command with retry logic and real-time progress reporting."""
+    cmd_executable = cfg.training_command[0]
+    if not file_manager.which(cmd_executable):
+        print(f"  → Error: '{cmd_executable}' command not found")
+        return None
+
+    attempt = 0
+    max_attempts = cfg.max_retries + 1
+    
+    def progress_callback(line: str):
+        # Look for patterns like "step 000xx" or "loss: x.xxxx"
+        step_match = re.search(r'step\s+(\d+)', line, re.IGNORECASE)
+        loss_match = re.search(r'loss:\s*([\d.]+)', line, re.IGNORECASE)
+        
+        report_parts = []
+        if step_match:
+            report_parts.append(f"step {step_match.group(1)}")
+        if loss_match:
+            report_parts.append(f"loss {loss_match.group(1)}")
+            
+        if report_parts:
+            # Overwrite the same line for cleaner progress reporting
+            print(f"      → progress: {' | '.join(report_parts)}", end="\r", flush=True)
+
+    while attempt < max_attempts:
+        try:
+            if cfg.debug_mode:
+                print(f"  → Debug: Running {' '.join(cfg.training_command)} (attempt {attempt + 1})")
+            
+            result = runner.run_streaming(
+                cfg.training_command,
+                timeout=cfg.training_timeout,
+                callback=progress_callback
+            )
+            # Ensure next print starts on a new line after progress reporting
+            print() 
+            return result
+            
+        except subprocess.TimeoutExpired as e:
+            print() # New line after potential progress reporting
+            attempt += 1
+            if attempt >= max_attempts:
+                print(f"  → Timeout (>{cfg.training_timeout}s) after {max_attempts} attempts")
+                return None
+            print(f"  → Timeout (>{cfg.training_timeout}s), retrying... ({attempt + 1}/{max_attempts})")
+        except Exception as e:
+            print() # New line after potential progress reporting
+            attempt += 1
+            if attempt >= max_attempts:
+                raise e
+            print(f"  → Error: {e}, retrying... ({attempt + 1}/{max_attempts})")
+            
+    return None
+
+
+def update_train_py(factors: Dict[str, str], file_manager: Optional[FileManager] = None) -> None:
+    """Update train.py hyperparameters with validation."""
+    update_config_file("train.py", factors, file_manager)
+
+
+def update_config_file(
+    config_file: str, 
+    factors: Dict[str, str], 
+    file_manager: Optional[FileManager] = None
+) -> None:
     """
-    Generic config file update function.
+    Update configuration file variables with robust regex matching.
     
-    Uses the same validation and safety checks as update_train_py.
+    Args:
+        config_file: Path to the file to modify
+        factors: Dictionary of variable names and their new values
+        file_manager: Optional FileManager instance
     """
-    config_path = Path(config_file)
-    content = config_path.read_text()
+    fm = file_manager or FileManager()
+    path = Path(config_file)
+    content = fm.read_text(path)
     
-    # Validate all required variables exist first
-    missing_vars = []
-    for key in factors.keys():
-        pattern = rf'^(\s*){re.escape(key)}\s*='
-        if not re.search(pattern, content, flags=re.MULTILINE):
-            missing_vars.append(key)
-    
-    if missing_vars:
-        raise TaguchiError(f"Variables not found in {config_file}: {missing_vars}")
-    
-    # Apply replacements with safer pattern matching
     original_content = content
     for key, value in factors.items():
-        pattern = rf'^(\s*)({re.escape(key)})\s*=\s*[^#\n]+(#.*)?$'
-        replacement = rf'\1\2 = {value}\3'
-        new_content = re.sub(pattern, replacement, content, flags=re.MULTILINE)
+        # Robust regex for Python variable assignment
+        # Matches:
+        #   VAR = VAL
+        #   VAR: type = VAL
+        #   VAR=VAL
+        # Handles comments on the same line and preserves their spacing.
+        # Only matches at the start of a line (with optional indentation).
+        pattern = rf'^(\s*)({re.escape(key)})(\s*(?::\s*[^=]+)?\s*=\s*)([^#\n]*?)([ \t]*)(#.*)?$'
         
-        # Verify the replacement actually happened
-        if new_content == content:
-            raise TaguchiError(f"Failed to update variable: {key}")
-        content = new_content
+        # Verify if variable exists
+        if not re.search(pattern, content, flags=re.MULTILINE):
+            raise TaguchiError(f"Variable '{key}' not found in {config_file} with expected assignment pattern.")
+            
+        replacement = rf'\g<1>\g<2>\g<3>{value}\g<5>\g<6>'
+        content = re.sub(pattern, replacement, content, flags=re.MULTILINE)
     
-    # Verify we actually made changes
     if content == original_content:
-        raise TaguchiError("No variables were updated - check factor names")
-    
-    config_path.write_text(content)
+        raise TaguchiError(f"No changes made to {config_file}. Verify factor names and file content.")
+        
+    fm.write_text(path, content)
 
 
 def parse_metric(output: str, metric: str) -> Optional[float]:
     """
-    Parse metric value from training output with better error handling.
+    Parse metric value from training output.
     
     Returns None if metric not found or invalid format.
     """
@@ -287,7 +304,6 @@ def parse_metric(output: str, metric: str) -> Optional[float]:
         try:
             return float(match.group(1))
         except ValueError:
-            print(f"  → Warning: Found {metric} but could not parse value: {match.group(1)}")
             return None
     return None
 

@@ -2,21 +2,17 @@
 Core Taguchi library interface using shell commands.
 """
 
-import shutil
-import subprocess
-import tempfile
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
+from .system import SystemRunner, FileManager
+from .errors import TaguchiError, CommandExecutionError, TimeoutError
+
 # Subprocess timeout in seconds — prevents hangs if the binary stalls.
 _CLI_TIMEOUT = 30
-
-
-class TaguchiError(Exception):
-    """Exception raised for Taguchi library errors."""
-    pass
 
 
 class Taguchi:
@@ -25,7 +21,14 @@ class Taguchi:
     Uses shell commands which is more robust than ctypes for complex structures.
     """
 
-    def __init__(self, cli_path: Optional[str] = None):
+    def __init__(
+        self, 
+        cli_path: Optional[str] = None,
+        runner: Optional[SystemRunner] = None,
+        file_manager: Optional[FileManager] = None
+    ):
+        self._runner = runner or SystemRunner()
+        self._file_manager = file_manager or FileManager()
         self._cli_path = self._find_cli(cli_path)
         self._array_cache: Optional[List[Dict]] = None
 
@@ -52,11 +55,11 @@ class Taguchi:
         ])
 
         for path in possible_paths:
-            if path.exists() and os.access(path, os.X_OK):
+            if self._file_manager.is_executable(path):
                 return str(path.absolute())
 
-        # Fall back to PATH lookup — shutil.which is cross-platform
-        found = shutil.which("taguchi")
+        # Fall back to PATH lookup
+        found = self._file_manager.which("taguchi")
         if found:
             return found
 
@@ -66,32 +69,33 @@ class Taguchi:
         """Run a taguchi command and return stdout."""
         cmd = [self._cli_path] + args
         try:
-            result = subprocess.run(
+            result = self._runner.run(
                 cmd,
-                capture_output=True,
-                text=True,
                 timeout=_CLI_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
-            raise TaguchiError(
-                f"Taguchi command timed out after {_CLI_TIMEOUT}s: {' '.join(args)}"
+            raise TimeoutError(
+                cmd,
+                _CLI_TIMEOUT,
+                operation="cli_execution",
+                cli_path=self._cli_path
             )
+        
         if result.returncode != 0:
-            error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
-            raise TaguchiError(f"Taguchi command failed: {error_msg}")
+            raise CommandExecutionError.from_subprocess_error(
+                cmd,
+                result,
+                operation="cli_execution",
+                cli_path=self._cli_path
+            )
         return result.stdout
 
-    def _get_arrays_info(self) -> List[Dict]:
-        """Return cached array metadata."""
-        if self._array_cache is not None:
-            return self._array_cache
-
-        output = self._run_command(["list-arrays"])
+    def _parse_list_arrays(self, output: str) -> List[Dict]:
+        """Parse the output of 'list-arrays' command."""
         arrays = []
-
         for line in output.strip().split('\n'):
-            match = re.match(
-                r'\s+(L\d+)\s+\(\s*(\d+)\s+runs,\s*(\d+)\s+cols,\s*(\d+)\s+levels\)',
+            match = re.search(
+                r'(L\d+)\s+\(\s*(\d+)\s+runs,\s*(\d+)\s+cols,\s*(\d+)\s+levels\)',
                 line,
             )
             if match:
@@ -101,10 +105,21 @@ class Taguchi:
                     'cols': int(match.group(3)),
                     'levels': int(match.group(4)),
                 })
+        return arrays
+
+    def _get_arrays_info(self) -> List[Dict]:
+        """Return cached array metadata."""
+        if self._array_cache is not None:
+            return self._array_cache
+
+        output = self._run_command(["list-arrays"])
+        arrays = self._parse_list_arrays(output)
 
         if not arrays:
             raise TaguchiError(
-                "list-arrays returned no arrays — CLI output may have changed format"
+                "list-arrays returned no arrays — CLI output may have changed format",
+                operation="list_arrays",
+                stdout=output
             )
 
         self._array_cache = arrays
@@ -123,7 +138,7 @@ class Taguchi:
                     'cols': array['cols'],
                     'levels': array['levels'],
                 }
-        raise TaguchiError(f"Array '{name}' not found")
+        raise TaguchiError(f"Array '{name}' not found", operation="get_array_info")
 
     def suggest_array(self, num_factors: int, max_levels: int) -> str:
         """Suggest the smallest orthogonal array that fits the experiment."""
@@ -146,26 +161,8 @@ class Taguchi:
         # Return the smallest sufficient array (fewest runs)
         return min(sufficient, key=lambda a: a['rows'])['name']
 
-    def generate_runs(self, tgu_path: str) -> List[Dict[str, Any]]:
-        """
-        Generate experiment runs from a .tgu file path or raw .tgu content string.
-
-        Returns a list of dicts: [{'run_id': int, 'factors': {name: value}}, ...]
-        """
-        if os.path.exists(tgu_path):
-            output = self._run_command(["generate", tgu_path])
-        else:
-            # Treat the argument as raw .tgu content
-            with tempfile.NamedTemporaryFile(
-                mode='w', suffix='.tgu', delete=False
-            ) as f:
-                f.write(tgu_path)
-                temp_path = f.name
-            try:
-                output = self._run_command(["generate", temp_path])
-            finally:
-                os.unlink(temp_path)
-
+    def _parse_generate(self, output: str) -> List[Dict[str, Any]]:
+        """Parse the output of 'generate' command."""
         runs = []
         for line in output.strip().split("\n"):
             if not line.startswith("Run "):
@@ -174,7 +171,8 @@ class Taguchi:
             if len(parts) < 2:
                 continue
             try:
-                run_id = int(parts[0][4:].strip())
+                run_id_str = parts[0][4:].strip()
+                run_id = int(run_id_str)
             except ValueError:
                 continue
             factors: Dict[str, str] = {}
@@ -183,8 +181,25 @@ class Taguchi:
                     key, _, value = pair.partition("=")
                     factors[key.strip()] = value.strip()
             runs.append({"run_id": run_id, "factors": factors})
-
         return runs
+
+    def generate_runs(self, tgu_path: str) -> List[Dict[str, Any]]:
+        """
+        Generate experiment runs from a .tgu file path or raw .tgu content string.
+
+        Returns a list of dicts: [{'run_id': int, 'factors': {name: value}}, ...]
+        """
+        if self._file_manager.exists(Path(tgu_path)):
+            output = self._run_command(["generate", tgu_path])
+        else:
+            # Treat the argument as raw .tgu content
+            temp_path = self._file_manager.create_temp_file(suffix='.tgu', content=tgu_path)
+            try:
+                output = self._run_command(["generate", str(temp_path)])
+            finally:
+                self._file_manager.remove(temp_path)
+
+        return self._parse_generate(output)
 
     def analyze(self, tgu_path: str, results_csv: str, metric: str = "response") -> str:
         """Run full analysis with main effects and optimal recommendations."""
@@ -197,3 +212,39 @@ class Taguchi:
         return self._run_command(
             ["effects", tgu_path, results_csv, "--metric", metric]
         )
+
+    def _parse_effects(self, output: str) -> List[Dict]:
+        """
+        Parse the main-effects table from CLI output.
+        """
+        effects = []
+        for line in output.strip().split('\n'):
+            # Factor name (word chars), range (number), then level means
+            match = re.match(r'\s*(\w+)\s+([\d.]+)\s+(.+)', line)
+            if not match:
+                continue
+
+            factor = match.group(1)
+            try:
+                range_val = float(match.group(2))
+            except ValueError:
+                continue
+
+            means_str = match.group(3)
+            # Match L<n>=<signed float> — handles negatives and scientific notation
+            level_matches = re.findall(r'L\d+=(-?[\d.]+(?:[eE][+-]?\d+)?)', means_str)
+            means = []
+            for m in level_matches:
+                try:
+                    means.append(float(m))
+                except ValueError:
+                    pass
+
+            if means:
+                effects.append({
+                    'factor': factor,
+                    'range': range_val,
+                    'level_means': means,
+                })
+
+        return effects

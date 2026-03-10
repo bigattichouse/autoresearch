@@ -2,12 +2,12 @@
 Analyzer class for Taguchi experimental results.
 """
 
-import tempfile
-import os
 import csv
-import re
+import io
+from pathlib import Path
 from typing import Dict, List, Optional, Any
 from .core import Taguchi, TaguchiError
+from .system import FileManager
 
 
 class Analyzer:
@@ -21,13 +21,20 @@ class Analyzer:
             print(analyzer.summary())
     """
 
-    def __init__(self, experiment: Any, metric_name: str = "response"):
-        self._taguchi = Taguchi()
+    def __init__(
+        self, 
+        experiment: Any, 
+        metric_name: str = "response",
+        taguchi: Optional[Taguchi] = None,
+        file_manager: Optional[FileManager] = None
+    ):
+        self._taguchi = taguchi or Taguchi()
+        self._file_manager = file_manager or FileManager()
         self._experiment = experiment
         self._metric_name = metric_name
         self._results: Dict[int, float] = {}
         self._effects: Optional[List[Dict]] = None
-        self._csv_path: Optional[str] = None
+        self._csv_path: Optional[Path] = None
 
     # ------------------------------------------------------------------
     # Result collection
@@ -54,95 +61,64 @@ class Analyzer:
         """Write the results CSV if needed; return (tgu_path, csv_path)."""
         if not self._results:
             raise TaguchiError(
-                "No results added. Call add_result() before analyzing."
+                "No results added. Call add_result() before analyzing.",
+                operation="ensure_files"
             )
 
         if self._csv_path is None:
-            fd, path = tempfile.mkstemp(suffix='.csv')
-            with os.fdopen(fd, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['run_id', self._metric_name])
-                for run_id, value in sorted(self._results.items()):
-                    writer.writerow([run_id, value])
-            self._csv_path = path
+            # Generate CSV content
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(['run_id', self._metric_name])
+            for run_id, value in sorted(self._results.items()):
+                writer.writerow([run_id, value])
+            
+            self._csv_path = self._file_manager.create_temp_file(
+                suffix='.csv', 
+                content=output.getvalue()
+            )
 
-        # Use the public API — no private method access
+        # Use the public API
         tgu_path = self._experiment.get_tgu_path()
-        return tgu_path, self._csv_path
-
-    def _parse_effects(self, output: str) -> List[Dict]:
-        """
-        Parse the main-effects table from CLI output.
-
-        Expected line format:
-            depth    0.026   L1=1.050, L2=1.024, L3=1.037
-
-        Handles:
-        - Negative level means (e.g. L1=-0.5)
-        - Extra whitespace / header/footer lines (silently skipped)
-        """
-        effects = []
-        for line in output.strip().split('\n'):
-            # Factor name (word chars), range (number), then level means
-            match = re.match(r'\s*(\w+)\s+([\d.]+)\s+(.+)', line)
-            if not match:
-                continue
-
-            factor = match.group(1)
-            try:
-                range_val = float(match.group(2))
-            except ValueError:
-                continue
-
-            means_str = match.group(3)
-            # Match L<n>=<signed float> — handles negatives and scientific notation
-            level_matches = re.findall(r'L\d+=(-?[\d.]+(?:[eE][+-]?\d+)?)', means_str)
-            means = []
-            for m in level_matches:
-                try:
-                    means.append(float(m))
-                except ValueError:
-                    pass
-
-            if means:
-                effects.append({
-                    'factor': factor,
-                    'range': range_val,
-                    'level_means': means,
-                })
-
-        return effects
+        return tgu_path, str(self._csv_path)
 
     def cleanup(self) -> None:
         """Delete the temporary results CSV if one was created."""
-        if self._csv_path and os.path.exists(self._csv_path):
-            try:
-                os.unlink(self._csv_path)
-            except OSError:
-                pass
-        self._csv_path = None
+        if self._csv_path:
+            self._file_manager.remove(self._csv_path)
+            self._csv_path = None
 
     # ------------------------------------------------------------------
     # Analysis API
     # ------------------------------------------------------------------
 
-    def main_effects(self) -> List[Dict[str, Any]]:
+    def main_effects(self, raw_output: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Calculate and cache main effects for all factors.
+        
+        If raw_output is provided, it parses that instead of calling the CLI.
+        This enables testing and allows Analyzer to accept raw result data 
+        (in the form of CLI output).
 
         Returns a list of dicts: [{'factor': str, 'range': float,
                                     'level_means': [float, ...]}, ...]
         """
+        if raw_output is not None:
+            self._effects = self._taguchi._parse_effects(raw_output)
+            return self._effects
+
         if self._effects is None:
             tgu_path, csv_path = self._ensure_files()
             output = self._taguchi.effects(
                 tgu_path, csv_path, metric=self._metric_name
             )
-            self._effects = self._parse_effects(output)
+            self._effects = self._taguchi._parse_effects(output)
             if not self._effects:
                 raise TaguchiError(
                     "effects command produced no parseable output. "
-                    "Check that run IDs in results match the experiment."
+                    "Check that run IDs in results match the experiment.",
+                    operation="main_effects",
+                    stdout=output
                 )
         return self._effects
 
@@ -233,8 +209,7 @@ class Analyzer:
 
     def __del__(self) -> None:
         try:
-            path = self.__dict__.get('_csv_path')
-            if path and os.path.exists(path):
-                os.unlink(path)
+            if self._csv_path:
+                self._file_manager.remove(self._csv_path)
         except Exception:
             pass

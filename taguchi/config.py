@@ -21,9 +21,14 @@ class TaguchiConfig:
     All settings have sensible defaults for backward compatibility.
     """
     
-    # Binary location and execution
+    # Binary location and execution (CLI-specific)
     cli_path: Optional[str] = None
     cli_timeout: int = 30
+    
+    # Training orchestration (Taguchi Mode)
+    training_timeout: int = 400
+    training_command: List[str] = field(default_factory=lambda: ["uv", "run", "train.py"])
+    config_file: str = "train.py"
     
     # Error handling and reliability  
     max_retries: int = 0
@@ -32,6 +37,7 @@ class TaguchiConfig:
     
     # Debugging and observability
     debug_mode: bool = False
+    dry_run: bool = False
     log_commands: bool = False
     log_command_output: bool = False
     
@@ -56,6 +62,9 @@ class TaguchiConfig:
         if self.cli_timeout <= 0:
             errors.append("cli_timeout must be positive")
             
+        if self.training_timeout <= 0:
+            errors.append("training_timeout must be positive")
+            
         if self.cli_path and not Path(self.cli_path).exists():
             errors.append(f"cli_path does not exist: {self.cli_path}")
             
@@ -76,13 +85,19 @@ class TaguchiConfig:
     @classmethod
     def from_environment(cls) -> "TaguchiConfig":
         """Create configuration from environment variables."""
+        training_cmd_str = os.getenv("TAGUCHI_TRAINING_CMD", "uv run train.py")
+        
         return cls(
             cli_path=os.getenv("TAGUCHI_CLI_PATH"),
             cli_timeout=int(os.getenv("TAGUCHI_CLI_TIMEOUT", "30")),
+            training_timeout=int(os.getenv("TAGUCHI_TRAINING_TIMEOUT", "400")),
+            training_command=training_cmd_str.split(),
+            config_file=os.getenv("TAGUCHI_CONFIG_FILE", "train.py"),
             max_retries=int(os.getenv("TAGUCHI_MAX_RETRIES", "0")),
             retry_delay=float(os.getenv("TAGUCHI_RETRY_DELAY", "1.0")),
             retry_backoff_multiplier=float(os.getenv("TAGUCHI_RETRY_BACKOFF", "2.0")),
             debug_mode=os.getenv("TAGUCHI_DEBUG", "false").lower() == "true",
+            dry_run=os.getenv("TAGUCHI_DRY_RUN", "false").lower() == "true",
             log_commands=os.getenv("TAGUCHI_LOG_COMMANDS", "false").lower() == "true",
             log_command_output=os.getenv("TAGUCHI_LOG_OUTPUT", "false").lower() == "true",
             working_directory=os.getenv("TAGUCHI_WORKING_DIR"),
@@ -96,10 +111,14 @@ class TaguchiConfig:
         return {
             "cli_path": self.cli_path,
             "cli_timeout": self.cli_timeout,
+            "training_timeout": self.training_timeout,
+            "training_command": self.training_command,
+            "config_file": self.config_file,
             "max_retries": self.max_retries,
             "retry_delay": self.retry_delay,
             "retry_backoff_multiplier": self.retry_backoff_multiplier,
             "debug_mode": self.debug_mode,
+            "dry_run": self.dry_run,
             "log_commands": self.log_commands,
             "log_command_output": self.log_command_output,
             "working_directory": self.working_directory,
